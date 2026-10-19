@@ -1,0 +1,211 @@
+name: Build IPA from MediaFire / Direct Link
+
+on:
+  workflow_dispatch:
+    inputs:
+      mediafire_url:
+        description: 'MediaFire or Direct ZIP Link'
+        required: true
+        default: 'https://www.mediafire.com/file/45b0dzjegz5curz/Xmodz+new.zip/file'
+      base_ipa_url:
+        description: 'Direct link to Base Game IPA (Optional)'
+        required: false
+        default: ''
+      app_name:
+        description: 'App Display Name'
+        required: true
+        default: 'XMODZ VIP MENU'
+      bundle_id:
+        description: 'Bundle Identifier'
+        required: true
+        default: 'com.xmodz.menu'
+
+jobs:
+  build-ipa:
+    runs-on: macos-14
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download & Extract from MediaFire
+        run: |
+          mkdir -p workspace_build
+          cd workspace_build
+
+          cat << 'EOF' > get_mediafire.py
+          import urllib.request, re, sys, os
+
+          url = sys.argv[1].strip()
+          print(f"Resolving: {url}")
+
+          if "mediafire.com" in url:
+              req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+              with urllib.request.urlopen(req) as resp:
+                  html = resp.read().decode('utf-8', errors='ignore')
+                  match = re.search(r'href=[\"\'](https?://download\d+\.mediafire\.com/[^\"\']+)[\"\']', html)
+                  if match:
+                      direct_url = match.group(1)
+                      print(f"Direct URL Found: {direct_url}")
+                  else:
+                      direct_url = url
+          else:
+              direct_url = url
+
+          print("Downloading project zip...")
+          os.system(f'curl -sL "{direct_url}" -o project.zip')
+          EOF
+
+          python3 get_mediafire.py "${{ github.event.inputs.mediafire_url }}"
+          
+          mkdir -p extracted
+          unzip -o project.zip -d extracted/
+
+          DYLIB_PATH=$(find extracted -iname "UnityFramework.dylib" | head -n 1)
+          if [ -z "$DYLIB_PATH" ]; then
+            DYLIB_PATH=$(find extracted -iname "*.dylib" | head -n 1)
+          fi
+          
+          echo "Found Tweak: $DYLIB_PATH"
+          cp "$DYLIB_PATH" ../UnityFramework.dylib
+          cd ..
+          ls -lh UnityFramework.dylib
+
+      - name: Setup Injection Tools
+        run: |
+          brew install optool || true
+
+      - name: Build Application Bundle
+        run: |
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          
+          if [ -n "${{ github.event.inputs.base_ipa_url }}" ]; then
+            echo "Downloading Game Base IPA..."
+            curl -sL "${{ github.event.inputs.base_ipa_url }}" -o base.ipa
+            unzip -q base.ipa
+            
+            APP_DIR=$(find Payload -maxdepth 1 -name "*.app" | head -n 1)
+            mkdir -p "$APP_DIR/Frameworks"
+            cp UnityFramework.dylib "$APP_DIR/Frameworks/"
+            
+            EXEC_NAME=$(defaults read "$PWD/$APP_DIR/Info.plist" CFBundleExecutable)
+            MAIN_EXEC="$APP_DIR/$EXEC_NAME"
+            
+            if command -v optool >/dev/null 2>&1; then
+              optool install -c load -p "@executable_path/Frameworks/UnityFramework.dylib" -t "$MAIN_EXEC" || true
+            fi
+            defaults write "$PWD/$APP_DIR/Info.plist" CFBundleDisplayName "$APP_NAME" || true
+          else
+            echo "Generating Standalone Native iOS Loader App..."
+            mkdir -p "Payload/${APP_NAME}.app/Frameworks"
+            APP_DIR="Payload/${APP_NAME}.app"
+            
+            cp UnityFramework.dylib "$APP_DIR/Frameworks/"
+            
+            cat << 'EOF' > main.m
+            #import <UIKit/UIKit.h>
+            #import <dlfcn.h>
+
+            @interface ViewController : UIViewController
+            @end
+
+            @implementation ViewController
+            - (void)viewDidLoad {
+                [super viewDidLoad];
+                self.view.backgroundColor = [UIColor colorWithRed:0.04 green:0.06 blue:0.1 alpha:1.0];
+                
+                UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(20, 120, self.view.bounds.size.width - 40, 140)];
+                label.numberOfLines = 0;
+                label.textAlignment = NSTextAlignmentCenter;
+                label.textColor = [UIColor cyanColor];
+                label.font = [UIFont boldSystemFontOfSize:22];
+                
+                NSString *dylibPath = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"Frameworks/UnityFramework.dylib"];
+                void *handle = dlopen([dylibPath UTF8String], RTLD_NOW | RTLD_GLOBAL);
+                if (handle) {
+                    label.text = @"XMODZ VIP ACTIVE\nUnityFramework.dylib Loaded\nTap Screen for Menu";
+                } else {
+                    label.text = @"XMODZ VIP RUNNING";
+                }
+                [self.view addSubview:label];
+            }
+            @end
+
+            @interface AppDelegate : UIResponder <UIApplicationDelegate>
+            @property (strong, nonatomic) UIWindow *window;
+            @end
+
+            @implementation AppDelegate
+            - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+                self.window = [[UIWindow alloc] initWithFrame:[[UIScreen mainScreen] bounds]];
+                self.window.rootViewController = [[ViewController alloc] init];
+                [self.window makeKeyAndVisible];
+                return YES;
+            }
+            @end
+
+            int main(int argc, char * argv[]) {
+                @autoreleasepool {
+                    return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
+                }
+            }
+            EOF
+
+            SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+            xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SDK_PATH" -miphoneos-version-min=14.0 \
+              -framework UIKit -framework Foundation -framework QuartzCore \
+              main.m -o "${APP_DIR}/XmodzApp"
+
+            cat << EOF > "${APP_DIR}/Info.plist"
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>CFBundleExecutable</key>
+                <string>XmodzApp</string>
+                <key>CFBundleIdentifier</key>
+                <string>${{ github.event.inputs.bundle_id }}</string>
+                <key>CFBundleName</key>
+                <string>${APP_NAME}</string>
+                <key>CFBundleDisplayName</key>
+                <string>${APP_NAME}</string>
+                <key>CFBundlePackageType</key>
+                <string>APPL</string>
+                <key>CFBundleShortVersionString</key>
+                <string>2.0.0</string>
+                <key>CFBundleVersion</key>
+                <string>2.0.0</string>
+                <key>CFBundleSupportedPlatforms</key>
+                <array>
+                    <string>iPhoneOS</string>
+                </array>
+                <key>DTPlatformName</key>
+                <string>iphoneos</string>
+                <key>LSRequiresIPhoneOS</key>
+                <true/>
+                <key>UIDeviceFamily</key>
+                <array>
+                    <integer>1</integer>
+                    <integer>2</integer>
+                </array>
+                <key>MinimumOSVersion</key>
+                <string>14.0</string>
+                <key>UIRequiresFullScreen</key>
+                <true/>
+            </dict>
+            </plist>
+            EOF
+          fi
+
+          chmod -R 755 Payload/
+          find Payload/ -type f -perm +111 -exec chmod 777 {} + || true
+
+      - name: Package IPA
+        run: |
+          zip -qry9 "XMODZ_VIP_MENU.ipa" Payload
+          ls -lh XMODZ_VIP_MENU.ipa
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XModz-VIP-IPA
+          path: "XMODZ_VIP_MENU.ipa"
