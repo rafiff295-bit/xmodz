@@ -29,57 +29,43 @@ jobs:
 
       - name: Download & Extract from MediaFire
         run: |
-          python3 - << 'PYEOF'
-          import urllib.request, re, os, zipfile
+          cat << 'EOF' > download_mediafire.py
+          import urllib.request, re, os, sys, zipfile
 
           url = "${{ github.event.inputs.mediafire_url }}".strip()
-          print("Resolving URL:", url)
-
-          headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+          print("Resolving MediaFire URL:", url)
+          headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
           direct_url = url
 
           if "mediafire.com" in url:
-              req = urllib.request.Request(url, headers=headers)
-              with urllib.request.urlopen(req) as resp:
-                  html = resp.read().decode("utf-8", errors="ignore")
-                  match = re.search(r'href=[\"\'](https?://download\d+\.mediafire\.com/[^\"\']+)[\"\']', html)
-                  if match:
-                      direct_url = match.group(1)
-                      print("Direct download URL found!")
+              try:
+                  req = urllib.request.Request(url, headers=headers)
+                  with urllib.request.urlopen(req) as resp:
+                      html = resp.read().decode("utf-8", errors="ignore")
+                      match = re.search(r'href=[\"\'](https?://download\d+\.mediafire\.com/[^\"\']+)[\"\']', html)
+                      if match:
+                          direct_url = match.group(1)
+                          print("Direct URL found!")
+              except Exception as e:
+                  print("Error parsing MediaFire link:", e)
 
-          print("Downloading zip...")
+          print("Downloading zip file...")
           req2 = urllib.request.Request(direct_url, headers=headers)
           with urllib.request.urlopen(req2) as in_stream, open("project.zip", "wb") as out_file:
-              while chunk := in_stream.read(1024*1024):
+              while chunk := in_stream.read(1024 * 1024):
                   out_file.write(chunk)
 
-          print("Downloaded size:", os.path.getsize("project.zip"))
+          print("Download complete. Zip size:", os.path.getsize("project.zip"))
 
-          print("Extracting UnityFramework.dylib...")
           with zipfile.ZipFile("project.zip") as z:
-              found = False
               for n in z.namelist():
                   if n.endswith("UnityFramework.dylib"):
                       with open("UnityFramework.dylib", "wb") as f:
                           f.write(z.read(n))
                       print(f"Extracted: {n} -> UnityFramework.dylib")
-                      found = True
                       break
-              if not found:
-                  for n in z.namelist():
-                      if n.endswith(".dylib"):
-                          with open("UnityFramework.dylib", "wb") as f:
-                              f.write(z.read(n))
-                          print(f"Extracted: {n} -> UnityFramework.dylib")
-                          found = True
-                          break
-
-          if os.path.exists("UnityFramework.dylib"):
-              print("SUCCESS! UnityFramework.dylib extracted, size:", os.path.getsize("UnityFramework.dylib"))
-          else:
-              print("ERROR: Could not find any .dylib in the zip archive")
-              exit(1)
-          PYEOF
+          EOF
+          python3 download_mediafire.py
           ls -lh UnityFramework.dylib
 
       - name: Build Application Bundle
@@ -87,34 +73,27 @@ jobs:
           APP_NAME="${{ github.event.inputs.app_name }}"
           BASE_URL="${{ github.event.inputs.base_ipa_url }}"
           BUNDLE_ID="${{ github.event.inputs.bundle_id }}"
-          
+
           if [ -n "$BASE_URL" ]; then
-            echo "Downloading Game Base IPA..."
+            echo "Injecting into Base Game IPA..."
             curl -sL "$BASE_URL" -o base.ipa
             unzip -q base.ipa
-            
             APP_DIR=$(find Payload -maxdepth 1 -name "*.app" | head -n 1)
             mkdir -p "$APP_DIR/Frameworks"
             cp UnityFramework.dylib "$APP_DIR/Frameworks/"
-            
             brew install optool || true
             EXEC_NAME=$(defaults read "$PWD/$APP_DIR/Info.plist" CFBundleExecutable)
-            MAIN_EXEC="$APP_DIR/$EXEC_NAME"
-            
-            if command -v optool >/dev/null 2>&1; then
-              optool install -c load -p "@executable_path/Frameworks/UnityFramework.dylib" -t "$MAIN_EXEC" || true
-            fi
+            optool install -c load -p "@executable_path/Frameworks/UnityFramework.dylib" -t "$APP_DIR/$EXEC_NAME" || true
             defaults write "$PWD/$APP_DIR/Info.plist" CFBundleDisplayName "$APP_NAME" || true
           else
-            echo "Building Standalone Native iOS Loader App..."
-            mkdir -p "Payload/${APP_NAME}.app/Frameworks"
-            APP_DIR="Payload/${APP_NAME}.app"
-            cp UnityFramework.dylib "$APP_DIR/Frameworks/"
+            echo "Generating Standalone iOS App..."
+            cat << 'EOF' > generate_app.py
+            import sys, os
 
-            python3 - << 'PYEOF2'
-            app_name = "${{ github.event.inputs.app_name }}"
-            bundle_id = "${{ github.event.inputs.bundle_id }}"
+            app_name = sys.argv[1]
+            bundle_id = sys.argv[2]
             app_dir = f"Payload/{app_name}.app"
+            os.makedirs(f"{app_dir}/Frameworks", exist_ok=True)
 
             objc_code = """#import <UIKit/UIKit.h>
             #import <dlfcn.h>
@@ -208,12 +187,14 @@ jobs:
 
             with open(f"{app_dir}/Info.plist", "w") as f:
                 f.write(plist_content)
-            PYEOF2
+            EOF
+            python3 generate_app.py "$APP_NAME" "$BUNDLE_ID"
+            cp UnityFramework.dylib "Payload/${APP_NAME}.app/Frameworks/"
 
             SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
             xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SDK_PATH" -miphoneos-version-min=14.0 \
               -framework UIKit -framework Foundation -framework QuartzCore \
-              main.m -o "${APP_DIR}/XmodzApp"
+              main.m -o "Payload/${APP_NAME}.app/XmodzApp"
           fi
 
           chmod -R 755 Payload/
